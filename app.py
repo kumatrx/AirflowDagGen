@@ -1,11 +1,22 @@
-# Airflow Automation Portal - version 2.0
-# Last updated: 2025-11-06
+# Airflow Automation Portal - version 3
 
 import streamlit as st
 from dag_generator.dag_builder import generate_dag_code
 from dag_generator.task_handlers import TASK_TYPES, TASK_PARAMS
 from datetime import datetime
 import json
+import os
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Set SSL certificates
+os.environ['REQUESTS_CA_BUNDLE'] = os.getenv('REQUESTS_CA_BUNDLE', './ssl-certs.pem')
+os.environ['CURL_CA_BUNDLE'] = os.getenv('CURL_CA_BUNDLE', './ssl-certs.pem')
+
+# Check if AI generation is enabled
+AI_GENERATION_ENABLED = os.getenv('ENABLE_AI_GENERATION', 'false').lower() == 'true'
 
 st.set_page_config(page_title="Airflow Automation Portal", page_icon=":rocket:")
 
@@ -45,7 +56,12 @@ elif choice == "Orchestrate a Data Pipeline":
     col1, col2 = st.columns(2)
     with col1:
         dag_name = st.text_input("DAG Name (ID)", "data_pipeline_dag", help="Unique pipeline identifier")
-        schedule_interval = st.text_input("Schedule Interval", "@daily", help="Cron or preset schedule")
+        dag_timezone = st.selectbox(
+            "DAG Timezone",
+            ["Select Timezone", "UTC", "BST"],
+            index=0,
+            help="Timezone for DAG schedule (defaults to UTC if not selected)"
+        )
         max_active_runs = st.number_input("Max Active Runs", 1, 200, 1, help="Concurrent runs limit")
         enable_timeout = st.checkbox("Enable DAG Run Timeout", value=False)
         dag_timeout_value = None
@@ -60,8 +76,68 @@ elif choice == "Orchestrate a Data Pipeline":
         catchup = st.checkbox("Catchup", False)
     with col2:
         tags = st.text_input("Tags for Monitoring (comma separated)", "")
-        purpose = st.text_area("Purpose / Business Description", "", height=110)
 
+        # Schedule Mode
+        schedule_mode = st.radio(
+            "Schedule Mode",
+            ["Preset", "Custom Cron"],
+            horizontal=True,
+            help="Choose between common presets or custom cron expression"
+        )
+
+        if schedule_mode == "Preset":
+            preset_options = {
+                "None (Manual only)": None,
+                "@once": "@once",
+                "@hourly": "@hourly",
+                "@daily": "@daily",
+                "@weekly": "@weekly",
+                "@monthly": "@monthly",
+                "@yearly": "@yearly"
+            }
+            selected_preset = st.selectbox(
+                "Schedule Interval",
+                list(preset_options.keys()),
+                index=3,  # Default to @daily
+                help="Select a preset schedule interval"
+            )
+            schedule_interval = preset_options[selected_preset]
+        else:
+            schedule_interval = st.text_input(
+                "Schedule Interval (Cron)",
+                "0 0 * * *",
+                help="Enter custom cron expression (e.g., '0 0 * * *' for daily at midnight)"
+            )
+
+            # Cron Guide - only show for Custom Cron mode
+            with st.expander("📖 Cron Expression Guide", expanded=False):
+                st.markdown("""
+                **Cron Format:** `minute hour day month weekday`
+
+                | Field | Values | Special Characters |
+                |-------|--------|-------------------|
+                | Minute | 0-59 | `*` `,` `-` `/` |
+                | Hour | 0-23 | `*` `,` `-` `/` |
+                | Day | 1-31 | `*` `,` `-` `/` |
+                | Month | 1-12 | `*` `,` `-` `/` |
+                | Weekday | 0-6 (Sun-Sat) | `*` `,` `-` `/` |
+
+                **Common Examples:**
+                - `0 0 * * *` → Daily at midnight
+                - `0 9 * * 1-5` → Weekdays at 9 AM
+                - `*/15 * * * *` → Every 15 minutes
+                - `0 */4 * * *` → Every 4 hours
+                - `0 0 1 * *` → First day of each month
+                - `0 0 * * 0` → Every Sunday at midnight
+                """)
+
+    # Purpose/Business Description - Full Width
+    purpose = st.text_area(
+        "Purpose / Business Description",
+        "Data pipeline for automated ETL processing and transformation workflow",
+        height=75,
+        help="Describe the purpose and business value of this DAG"
+    )
     with st.expander("Default Args / Advanced Settings", expanded=False):
         colA, colB, colC = st.columns(3)
         with colA:
@@ -106,6 +182,35 @@ elif choice == "Orchestrate a Data Pipeline":
                 if task_type in ["PythonOperator", "BranchPythonOperator"] and param in ("provide_context",
                                                                                          "op_kwargs"):
                     continue
+
+                # Special handling for sensor parameters
+                if task_type in ["FileSensor", "HttpSensor"]:
+                    if param == "poke_interval":
+                        params[param] = st.number_input(f"Poke Interval (seconds) for Task {i + 1}",
+                                                        min_value=1, value=60,
+                                                        key=f"{param}_{i}",
+                                                        help="How often to check if condition is met")
+                        continue
+                    elif param == "timeout":
+                        params[param] = st.number_input(f"Timeout (seconds) for Task {i + 1}",
+                                                        min_value=1, value=1800,
+                                                        key=f"{param}_{i}",
+                                                        help="Maximum time to wait before failing")
+                        continue
+                    elif param == "mode":
+                        params[param] = st.selectbox(f"Mode for Task {i + 1}",
+                                                     ["poke", "reschedule"],
+                                                     index=1,  # Default to reschedule
+                                                     key=f"{param}_{i}",
+                                                     help="'reschedule' frees worker between checks (recommended)")
+                        continue
+                    elif param == "soft_fail":
+                        params[param] = st.checkbox(f"Soft Fail for Task {i + 1}",
+                                                    value=False,
+                                                    key=f"{param}_{i}",
+                                                    help="Task succeeds even if condition is not met")
+                        continue
+
                 params[param] = st.text_input(f"{param} for Task {i + 1}", key=f"{param}_{i}")
 
             if task_type in ["PythonOperator", "BranchPythonOperator"]:
@@ -138,13 +243,159 @@ elif choice == "Orchestrate a Data Pipeline":
                         dependencies.append((tid_i, tid_j))
 
     st.markdown("### Define Custom Python Functions (Advanced)")
+    # Add helpful expander with examples (existing code)
+    with st.expander("📖 Custom Function Examples & Guide", expanded=False):
+        st.markdown("""
+        **Enter complete Python function definitions. The function name will be auto-detected.**
+
+        ### Example 1: Simple Data Processing
+        ```python
+        def process_data(data):
+            \"\"\"Process the input data\"\"\"
+            result = data.upper()
+            return result
+        ```
+
+        ### Example 2: Function Using Airflow Context
+        ```python
+        def get_date_info(**context):
+            \"\"\"Get execution date information\"\"\"
+            exec_date = context['execution_date']
+            return exec_date.strftime('%Y-%m-%d')
+        ```
+
+        ### Example 3: Branch Function (for BranchPythonOperator)
+        ```python
+        def choose_path(**context):
+            \"\"\"Choose execution path based on time\"\"\"
+            from datetime import datetime
+            hour = datetime.now().hour
+            return 'morning_task' if hour < 12 else 'afternoon_task'
+        ```
+        """)
     custom_functions = {}
     num_funcs = st.number_input("Number of custom functions", 0, 5, 0)
     for i in range(num_funcs):
-        func_name = st.text_input(f"Function {i + 1} Name", key=f"func_name_{i}")
-        func_code = st.text_area(f"Function {i + 1} Code", height=100, key=f"func_code_{i}")
-        if func_name and func_code:
-            custom_functions[func_name] = func_code
+        st.markdown(f"#### Function {i + 1}")
+        generation_mode_options = ["Write Code Manually"]
+        if AI_GENERATION_ENABLED:
+            generation_mode_options.append("Generate with AI ✨")
+
+        generation_mode = st.radio(
+            f"Generation Mode for Function {i + 1}",
+            generation_mode_options,
+            horizontal=True,
+            key=f"generation_mode_{i}"
+        )
+
+        # AI Generation Mode (NEW)
+        if generation_mode == "Generate with AI ✨":
+            st.info("💡 Describe what the function should do in plain English")
+
+            description = st.text_area(
+                f"Function {i + 1} Description",
+                height=100,
+                key=f"func_description_{i}",
+                placeholder="""Example: Read data from XCom, filter rows where status is 'active', calculate the average of the amount column, push result back to XCom, and return the average value"""
+            )
+
+            col_gen1, col_gen2 = st.columns([3, 1])
+
+            with col_gen1:
+                if st.button(f"🤖 Generate Function", key=f"generate_{i}"):
+                    if not description.strip():
+                        st.warning("Please provide a description of the function")
+                    else:
+                        with st.spinner("Generating function... This may take a few seconds."):
+                            try:
+                                from dag_generator.ai_function_generator import AIFunctionGenerator
+
+                                generator = AIFunctionGenerator()
+                                result = generator.generate_function(description, context='airflow')
+
+                                if result['success']:
+                                    # Store generated code in session state
+                                    st.session_state[f'generated_code_{i}'] = result['function_code']
+                                    st.success(f"✓ Function '{result['function_name']}' generated successfully!")
+                                else:
+                                    st.error(f"⚠️ Generation failed: {result['error']}")
+
+                            except ValueError as e:
+                                st.error(f"⚠️ Configuration error: {str(e)}")
+                                st.info("Please contact administrator to configure LLM API credentials")
+                            except Exception as e:
+                                st.error(f"⚠️ Error: {str(e)}")
+
+            with col_gen2:
+                if f'generated_code_{i}' in st.session_state:
+                    if st.button("🔄 Regenerate", key=f"regenerate_{i}"):
+                        # Clear stored code to allow regeneration
+                        if f'generated_code_{i}' in st.session_state:
+                            del st.session_state[f'generated_code_{i}']
+                        st.experimental_rerun()
+
+        if generation_mode == "Write Code Manually" or f'generated_code_{i}' in st.session_state:
+
+            if generation_mode == "Generate with AI ✨" and f'generated_code_{i}' in st.session_state:
+                st.markdown("**📝 Review and Edit Generated Code:**")
+                initial_code = st.session_state[f'generated_code_{i}']
+            else:
+                initial_code = ""
+
+            func_code = st.text_area(
+                f"Function {i + 1} Code" if generation_mode == "Write Code Manually" else "",
+                value=initial_code,
+                height=200,
+                key=f"func_code_{i}",
+                placeholder="""def my_function(**context):
+            # Your code here
+            result = "processed"
+            return result""" if not initial_code else None,
+                help="Complete Python function definition including def statement"
+            )
+
+            if func_code:
+                # Auto-extract function name (existing logic)
+                import re
+
+                match = re.search(r'def\s+(\w+)\s*\(', func_code)
+
+                if match:
+                    func_name = match.group(1)
+                    custom_functions[func_name] = func_code
+                    st.success(f"✓ Function '{func_name}' ready to use")
+                elif func_code.strip().startswith('def '):
+                    st.error(f"⚠️ Could not detect function name from code. Please check syntax.")
+                else:
+                    st.warning(f"⚠️ Function code should start with 'def function_name(...):' ")
+
+
+    # Sensor Task Validation
+    sensor_tasks = [task_type for _, task_type, _ in tasks if 'Sensor' in task_type]
+
+    if sensor_tasks and schedule_interval is not None:
+        st.warning("""
+        ⚠️ **Sensor Task Detected with Scheduled Interval**
+
+        Your DAG includes sensor tasks ({}) and has a schedule interval set.
+
+        **Best Practice Recommendation:**
+        - Sensor-based DAGs are typically **event-driven** (not time-driven)
+        - Consider setting Schedule Interval to **"None (Manual only)"**
+        - This allows the DAG to run when triggered manually or by external events
+        - Sensors will wait for conditions (file arrival, HTTP endpoint, etc.)
+
+        **Current Setup:**
+        - DAG will run on schedule AND wait for sensor conditions
+        - This may lead to multiple concurrent runs waiting on the same event
+        - Could consume worker slots unnecessarily
+
+        **Alternative:** If you need scheduled checks, ensure:
+        - `mode="reschedule"` on sensor tasks (frees worker between checks)
+        - Appropriate `poke_interval` settings
+        - Reasonable `timeout` values
+        """.format(", ".join(set(sensor_tasks))))
+
 
     if st.button("Generate DAG Code"):
         unit_map = {"Minutes": "minutes", "Seconds": "seconds", "Hours": "hours"}
@@ -160,7 +411,7 @@ elif choice == "Orchestrate a Data Pipeline":
             default_args['on_failure_callback'] = failure_callback
 
         if retries > 0:
-            default_args['retries'] = retries
+            default_args['retries'] = int(retries)
             if retry_exponential_backoff:
                 default_args['retry_exponential_backoff'] = retry_exponential_backoff
             if retry_delay_value > 0:
@@ -181,6 +432,10 @@ elif choice == "Orchestrate a Data Pipeline":
         if enable_timeout and dag_timeout_value:
             unit_param = unit_map.get(dag_timeout_unit, "minutes")
             extra_args.append(f"dagrun_timeout=timedelta({unit_param}={dag_timeout_value})")
+
+        # Handle timezone - only add if BST is selected (UTC is default)
+        if dag_timezone == "BST":
+            extra_args.append('timezone=pendulum.timezone("Europe/London")')
 
         dag_code = generate_dag_code(
             dag_name,
