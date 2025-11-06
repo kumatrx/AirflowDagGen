@@ -1,5 +1,4 @@
-# Airflow DAG Validator - version 2.0
-# Last updated: 2025-11-06
+# Airflow DAG Validator - version 3
 
 import ast
 
