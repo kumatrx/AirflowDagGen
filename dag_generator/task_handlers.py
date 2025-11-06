@@ -1,4 +1,4 @@
-# Airflow DAG Task Handlers - version 2.0
+# Airflow DAG Task Handlers - version 3
 
 class TaskTypeBase:
     def generate_code(self, task_id: str, params: dict) -> str:
@@ -71,26 +71,82 @@ class BranchPythonOperatorTask(TaskTypeBase):
 )
 '''
 
+
 class HttpSensorTask(TaskTypeBase):
     def generate_code(self, task_id, params):
         endpoint = params.get('endpoint', '')
         method = params.get('method', 'GET')
-        return f'''{task_id} = HttpSensor(
+        poke_interval = params.get('poke_interval', '')
+        timeout = params.get('timeout', '')
+        mode = params.get('mode', '')
+        soft_fail = params.get('soft_fail', '')
+
+        # Build base task
+        code = f'''{task_id} = HttpSensor(
     task_id="{task_id}",
     http_conn_id="http_default",
     endpoint="{endpoint}",
-    method="{method}"
+    method="{method}"'''
+
+        # Add optional parameters if provided
+        if poke_interval:
+            code += f''',
+    poke_interval={poke_interval}'''
+
+        if timeout:
+            code += f''',
+    timeout={timeout}'''
+
+        if mode:
+            code += f''',
+    mode="{mode}"'''
+
+        if soft_fail:
+            soft_fail_val = 'True' if soft_fail else 'False'
+            code += f''',
+    soft_fail={soft_fail_val}'''
+
+        code += '''
 )
 '''
+        return code
+
 
 class FileSensorTask(TaskTypeBase):
     def generate_code(self, task_id, params):
         filepath = params.get('filepath', '/tmp/dummy.txt')
-        return f'''{task_id} = FileSensor(
+        poke_interval = params.get('poke_interval', '')
+        timeout = params.get('timeout', '')
+        mode = params.get('mode', '')
+        soft_fail = params.get('soft_fail', '')
+
+        # Build base task
+        code = f'''{task_id} = FileSensor(
     task_id="{task_id}",
-    filepath="{filepath}"
+    filepath="{filepath}"'''
+
+        # Add optional parameters if provided
+        if poke_interval:
+            code += f''',
+    poke_interval={poke_interval}'''
+
+        if timeout:
+            code += f''',
+    timeout={timeout}'''
+
+        if mode:
+            code += f''',
+    mode="{mode}"'''
+
+        if soft_fail:
+            soft_fail_val = 'True' if soft_fail else 'False'
+            code += f''',
+    soft_fail={soft_fail_val}'''
+
+        code += '''
 )
 '''
+        return code
 
 class SqlOperatorTask(TaskTypeBase):
     def generate_code(self, task_id, params):
@@ -155,16 +211,16 @@ class SnowflakeOperatorTask(TaskTypeBase):
 
 TASK_TYPES = {
     "BashOperator": BashOperatorTask(),
-    "PythonOperator": PythonOperatorTask(),
+    "BranchPythonOperator": BranchPythonOperatorTask(),
+    "DockerOperator": DockerOperatorTask(),
     "DummyOperator": DummyOperatorTask(),
     "EmailOperator": EmailOperatorTask(),
-    "BranchPythonOperator": BranchPythonOperatorTask(),
-    "HttpSensor": HttpSensorTask(),
     "FileSensor": FileSensorTask(),
+    "HttpSensor": HttpSensorTask(),
+    "PythonOperator": PythonOperatorTask(),
     "SqlOperator": SqlOperatorTask(),
-    "DockerOperator": DockerOperatorTask(),
-    "TriggerDagRunOperator": TriggerDagRunOperatorTask(),
     "SnowflakeOperator": SnowflakeOperatorTask(),
+    "TriggerDagRunOperator": TriggerDagRunOperatorTask(),
 }
 
 TASK_PARAMS = {
@@ -173,8 +229,8 @@ TASK_PARAMS = {
     "DummyOperator": [],
     "EmailOperator": ["to", "subject", "html_content"],
     "BranchPythonOperator": ["python_callable", "provide_context", "op_kwargs"],
-    "HttpSensor": ["endpoint", "method"],
-    "FileSensor": ["filepath"],
+    "HttpSensor": ["endpoint", "method", "poke_interval", "timeout", "mode", "soft_fail"],
+    "FileSensor": ["filepath", "poke_interval", "timeout", "mode", "soft_fail"],
     "SqlOperator": ["sql", "conn_id"],
     "DockerOperator": ["image", "command"],
     "TriggerDagRunOperator": ["trigger_dag_id"],
