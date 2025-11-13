@@ -3,9 +3,13 @@
 import streamlit as st
 from dag_generator.dag_builder import generate_dag_code
 from dag_generator.task_handlers import TASK_TYPES, TASK_PARAMS
+from dag_generator.test_runner import run_ai_unit_tests
 from datetime import datetime
 import json
 import os
+import io
+import zipfile
+import time
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -14,6 +18,44 @@ load_dotenv()
 # Set SSL certificates
 os.environ['REQUESTS_CA_BUNDLE'] = os.getenv('REQUESTS_CA_BUNDLE', './ssl-certs.pem')
 os.environ['CURL_CA_BUNDLE'] = os.getenv('CURL_CA_BUNDLE', './ssl-certs.pem')
+
+#Initialize AI
+from dag_generator.ai_function_generator import AIFunctionGenerator
+generator = AIFunctionGenerator()
+
+# Provide download for cloudwatchwrapper.py, alert_notification_handlers.py
+def provide_package_downloads(package_files):
+    st.info(
+        """
+        If you wish to use our built-in solution for Failure and Success notifications, please download these packages and place them inside the `dags/utils/` folder. 
+        These files are required for the "Failure Notification Types" and "Success Notification Types" options below to function correctly.
+        
+        After placing the files, they will be importable as  
+        `from utils.alert_notification_handlers import notify_success, notify_failure`
+
+        Alternatively, if you prefer to use your own notification handling approach, you may define custom failure and success handler functions and assign them directly in your DAG. 
+        In that case, you do not need to download or use the packages provided here.
+        """
+    )
+
+    def create_zip(files):
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+            for file_path in files:
+                if os.path.exists(file_path):
+                    zip_file.write(file_path, arcname=os.path.basename(file_path))
+        zip_buffer.seek(0)
+        return zip_buffer
+
+    zip_data = create_zip(package_files)
+
+    st.download_button(
+        label="Download all packages as ZIP",
+        data=zip_data,
+        file_name="alert_packages.zip",
+        mime="application/zip"
+    )
+
 
 # Check if AI generation is enabled
 AI_GENERATION_ENABLED = os.getenv('ENABLE_AI_GENERATION', 'false').lower() == 'true'
@@ -52,7 +94,6 @@ if choice == "Airflow Connection Management (coming soon)":
 
 elif choice == "Orchestrate a Data Pipeline":
     st.subheader("Pipeline DAG Orchestration")
-
     col1, col2 = st.columns(2)
     with col1:
         dag_name = st.text_input("DAG Name (ID)", "data_pipeline_dag", help="Unique pipeline identifier")
@@ -147,7 +188,20 @@ elif choice == "Orchestrate a Data Pipeline":
         with colC:
             end_date = st.date_input("End Date", value=datetime(2099, 12, 31))
         depends_on_past = st.checkbox("Depends on previous run")
-        failure_callback = st.text_input("On Failure Callback function", "")
+        # Call inside Streamlit app with actual file paths
+        package_files = ["./cloudwatchwrapper.py", "./alert_notification_handlers.py"]
+        provide_package_downloads(package_files)
+        # Notification options for the user
+        notif_types = ["Email", "Incident"]
+        failure_notif_options = st.multiselect("Failure Notification Types", notif_types)
+        success_notif_options = st.multiselect("Success Notification Types", notif_types)
+
+        # Collect email ids if email is selected
+        if "Email" in failure_notif_options:
+            failure_emails = st.text_input("Failure Notification Emails (comma separated)",
+                                           value="example1@test.com,example2@test.com")
+        if "Email" in success_notif_options:
+            success_emails = st.text_input("Success Notification Emails (comma separated)", value="example1@test.com")
 
         st.markdown("**Retry Settings**")
         colR1, colR2, colR3 = st.columns([1, 1, 1.5])
@@ -230,6 +284,66 @@ elif choice == "Orchestrate a Data Pipeline":
                 params['provide_context'] = False
                 params['op_kwargs'] = {}
 
+            # Checkbox to enable individual retries per task
+            enable_individual_retries = st.checkbox(
+                f"Enable individual retries for Task {i + 1}?",
+                key=f"enable_individual_retries_{i}"
+            )
+
+            if enable_individual_retries:
+                st.markdown("### Retry Settings for this Task")
+                task_retries = st.number_input(
+                    f"Retries for Task",
+                    0, 20, 0,
+                    help="Number of retry attempts for this task",
+                    key=f"task_retries_{i}"
+                )
+                task_retry_delay_value = st.number_input(
+                    f"Retry Delay Value",
+                    1, 10000, 5,
+                    help="Delay value between retries",
+                    key=f"task_retry_delay_value_{i}"
+                )
+                task_retry_delay_unit = st.selectbox(
+                    f"Retry Delay Unit",
+                    ["minutes", "seconds", "hours"],
+                    index=0,
+                    key=f"task_retry_delay_unit_{i}"
+                )
+                task_retry_exponential_backoff = st.checkbox(
+                    f"Enable Exponential Backoff",
+                    help="If enabled, retry delays increase exponentially",
+                    key=f"task_retry_exponential_backoff_{i}"
+                )
+                task_max_retry_delay_value = st.number_input(
+                    f"Max Retry Delay Value",
+                    1, 10000, 60,
+                    help="Maximum delay between retries",
+                    key=f"task_max_retry_delay_value_{i}"
+                )
+                task_max_retry_delay_unit = st.selectbox(
+                    f"Max Retry Delay Unit",
+                    ["minutes", "seconds", "hours"],
+                    index=0,
+                    key=f"task_max_retry_delay_unit_{i}"
+                )
+
+                # Store retry config for downstream use
+                task_retry_config = {
+                    "retries": task_retries,
+                    "retry_delay_value": task_retry_delay_value,
+                    "retry_delay_unit": task_retry_delay_unit,
+                    "retry_exponential_backoff": task_retry_exponential_backoff,
+                    "max_retry_delay_value": task_max_retry_delay_value,
+                    "max_retry_delay_unit": task_max_retry_delay_unit,
+                    "individual_retry_enabled": enable_individual_retries
+                }
+            else:
+                task_retry_config = None
+
+            if task_retry_config:
+                params.update(task_retry_config)
+
             tasks.append((task_id, task_type, params))
 
     st.markdown("### Define dependencies (upstream >> downstream)")
@@ -277,6 +391,8 @@ elif choice == "Orchestrate a Data Pipeline":
     num_funcs = st.number_input("Number of custom functions", 0, 5, 0)
     for i in range(num_funcs):
         st.markdown(f"#### Function {i + 1}")
+        if f'gen_counter_{i}' not in st.session_state:
+            st.session_state[f'gen_counter_{i}'] = 0
         generation_mode_options = ["Write Code Manually"]
         if AI_GENERATION_ENABLED:
             generation_mode_options.append("Generate with AI ✨")
@@ -296,7 +412,7 @@ elif choice == "Orchestrate a Data Pipeline":
                 f"Function {i + 1} Description",
                 height=100,
                 key=f"func_description_{i}",
-                placeholder="""Example: Read data from XCom, filter rows where status is 'active', calculate the average of the amount column, push result back to XCom, and return the average value"""
+                placeholder="""Example: Read data from XCom, push result back to XCom, skip dag runs, verify output of previous task"""
             )
 
             col_gen1, col_gen2 = st.columns([3, 1])
@@ -308,15 +424,15 @@ elif choice == "Orchestrate a Data Pipeline":
                     else:
                         with st.spinner("Generating function... This may take a few seconds."):
                             try:
-                                from dag_generator.ai_function_generator import AIFunctionGenerator
-
-                                generator = AIFunctionGenerator()
                                 result = generator.generate_function(description, context='airflow')
 
                                 if result['success']:
                                     # Store generated code in session state
+                                    st.session_state[f'gen_counter_{i}'] += 1
                                     st.session_state[f'generated_code_{i}'] = result['function_code']
+                                    st.session_state[f'function_name_{i}'] = result['function_name']
                                     st.success(f"✓ Function '{result['function_name']}' generated successfully!")
+                                    st.rerun()
                                 else:
                                     st.error(f"⚠️ Generation failed: {result['error']}")
 
@@ -332,13 +448,21 @@ elif choice == "Orchestrate a Data Pipeline":
                         # Clear stored code to allow regeneration
                         if f'generated_code_{i}' in st.session_state:
                             del st.session_state[f'generated_code_{i}']
-                        st.experimental_rerun()
+                        if f'function_name_{i}' in st.session_state:
+                            del st.session_state[f'function_name_{i}']
+                        st.session_state[f'gen_counter_{i}'] += 1
+                        st.rerun()
 
         if generation_mode == "Write Code Manually" or f'generated_code_{i}' in st.session_state:
 
             if generation_mode == "Generate with AI ✨" and f'generated_code_{i}' in st.session_state:
                 st.markdown("**📝 Review and Edit Generated Code:**")
                 initial_code = st.session_state[f'generated_code_{i}']
+                # Insert the AI-generated code disclaimer message here:
+                st.info(
+                    "This code is generated by AI and provided as a helpful starting point. "
+                    "Please review and customize it carefully to suit your needs."
+                )
             else:
                 initial_code = ""
 
@@ -346,7 +470,7 @@ elif choice == "Orchestrate a Data Pipeline":
                 f"Function {i + 1} Code" if generation_mode == "Write Code Manually" else "",
                 value=initial_code,
                 height=200,
-                key=f"func_code_{i}",
+                key=f"func_code_{i}_{st.session_state[f'gen_counter_{i}']}",
                 placeholder="""def my_function(**context):
             # Your code here
             result = "processed"
@@ -407,8 +531,10 @@ elif choice == "Orchestrate a Data Pipeline":
             'depends_on_past': depends_on_past,
         }
 
-        if failure_callback:
-            default_args['on_failure_callback'] = failure_callback
+        default_args['failure_notif_options'] = failure_notif_options if 'failure_notif_options' in locals() else []
+        default_args['failure_emails'] = failure_emails if ('failure_emails' in locals() and failure_emails) else ""
+        default_args['success_notif_options'] = success_notif_options if 'success_notif_options' in locals() else []
+        default_args['success_emails'] = success_emails if ('success_emails' in locals() and success_emails) else ""
 
         if retries > 0:
             default_args['retries'] = int(retries)
@@ -449,9 +575,8 @@ elif choice == "Orchestrate a Data Pipeline":
 
         st.code(dag_code, language="python")
 
-        # Validate DAG code
+        # 1. Validate DAG code locally
         from dag_generator.dag_validator import validate_dag_code
-
         is_valid, validation_msg = validate_dag_code(dag_code)
 
         # Store DAG code in session state to persist across reruns
@@ -463,6 +588,81 @@ elif choice == "Orchestrate a Data Pipeline":
     # Display validation and export options (outside the Generate button to persist)
     if 'dag_code' in st.session_state and st.session_state.get('is_valid'):
         st.success(st.session_state['validation_msg'])
+
+        # 2. Ask user if they want AI to review the code
+        st.info("""
+        **AI-Driven DAG Code Review**
+
+        Quickly assess your generated Airflow DAG for:
+        - Code quality and optimization tips
+        - Security vulnerability alerts
+        - Potential task dependency inefficiencies
+        - Error handling improvements
+
+        Instantly get actionable feedback to enhance reliability and maintainability before deployment.
+        """)
+
+        if st.button("Run AI Code Review", key="run_ai_review"):
+            with st.spinner("AI is analyzing your DAG code..."):
+                generator = AIFunctionGenerator()
+                review_result = generator.generate_code_review(st.session_state['dag_code'])
+            if review_result.get('success'):
+                st.markdown("### AI-Powered Code Review Report")
+                st.success("AI review completed. See suggestions below.")
+                st.markdown(review_result['review'])  # You can further format this as HTML
+            else:
+                st.error(f"Review failed: {review_result.get('error', 'Unknown error')}")
+
+        st.info("""
+        **AI-Driven DAG Testing & Reporting**
+
+        - Automatically generates comprehensive unit test scripts for your DAG and custom functions.
+        - Provides detailed, ready-to-run test code that covers common edge cases, notification flows, and error paths.
+        - Lets you download and run tests locally or in your CI environment.
+        - Generates a test report after you run the tests, capturing pass/fail and coverage details.
+        - Helps catch parameter issues, unreachable paths, notification triggers, and edge cases early.
+
+        Save time writing tests and increase confidence in DAG reliability with AI assistance.
+        """)
+
+        if st.button("Run AI Automated Testing", key="ai_testing"):
+            step_times = {}
+
+            t0 = time.time()
+            st.session_state['spinner_msg'] = "Generating unit tests with AI..."
+            with st.spinner(st.session_state['spinner_msg']):
+                test_result = generator.generate_unit_tests(st.session_state['dag_code'])
+            t1 = time.time()
+            step_times['Unit test generation'] = t1 - t0
+
+            if test_result.get("success"):
+                st.session_state['spinner_msg'] = "Running tests in secure environment..."
+                with st.spinner(st.session_state['spinner_msg']):
+                    test_execution = run_ai_unit_tests(st.session_state['dag_code'], test_result["unit_tests"])
+                t2 = time.time()
+                step_times['Test execution'] = t2 - t1
+
+                # Save downloads
+                st.download_button("Download Unit Test Script", test_result["unit_tests"], file_name="test_dag.py")
+                if "test_report" in test_execution:
+                    import json
+
+                    report_json = json.dumps(test_execution["test_report"], indent=2)
+                    st.download_button("Download Test Report (JSON)", report_json, file_name="test_report.json")
+                st.success(f"All steps complete! Details below. (UnitTests: {step_times['Unit test generation']:.2f}s, "
+                           f"Test Run: {step_times['Test execution']:.2f}s)")
+
+                # Present summary results in UI
+                st.markdown("### Test Results")
+                if "test_report" in test_execution:
+                    for test in test_execution["test_report"].get("tests", []):
+                        icon = "✅" if test["outcome"] == "passed" else "❌"
+                        st.write(f"{icon} `{test['nodeid']}` — {test['outcome']}")
+                else:
+                    st.warning("Test report missing or could not be parsed.")
+
+            else:
+                st.error(f"AI could not generate test code: {test_result['error']}")
 
         # Show export options
         st.markdown("---")
@@ -516,7 +716,7 @@ elif choice == "Orchestrate a Data Pipeline":
 
             if st.button("Push to GitLab", type="primary", use_container_width=True, key="push_gitlab_btn"):
                 if gitlab_url and gitlab_token:
-                    from dag_generator.gitlab_pusher import push_to_gitlab
+                    from dag_generator.gitlab_utils import push_to_gitlab
 
                     success, msg = push_to_gitlab(
                         st.session_state['dag_code'],
