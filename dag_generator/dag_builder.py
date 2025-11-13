@@ -2,7 +2,22 @@
 
 from dag_generator.task_handlers import TASK_TYPES
 from datetime import datetime, date
+import streamlit as st
+import re
+from datetime import timedelta
+from dag_generator.utils.alert_notification_handlers import notify_failure, notify_success
 
+def format_timedelta_code(value, unit):
+    # Sanitize unit if needed (should be one of valid timedelta args)
+    valid_units = ["days", "seconds", "microseconds", "milliseconds", "minutes", "hours", "weeks"]
+    if unit not in valid_units:
+        unit = "seconds"  # fallback
+    return f"timedelta({unit}={value})"
+
+
+def fix_datetime_calls(func_code):
+    code = re.sub(r'datetime\\.datetime\\.','datetime', func_code)
+    return code
 
 def python_repr(val):
     """
@@ -24,11 +39,28 @@ def python_repr(val):
     else:
         return str(val)
 
+def clean_duplicate_imports(custom_functions: dict) -> dict:
+    forbidden = ['import datetime', 'from datetime import datetime']
+    cleaned = {}
+
+    for func_name, func_code in custom_functions.items():
+        lines = []
+        for line in func_code.split('\n'):
+            if line.strip() not in forbidden:
+                lines.append(line)
+        cleaned[func_name] = '\n'.join(lines)
+    return cleaned
 
 def generate_dag_code(dag_name, schedule_interval, tasks, dependencies, custom_functions, extra_args=None,
                       default_args_dict=None):
     extra_args = extra_args or []
     default_args_dict = default_args_dict or {}
+    failure_notif_options = default_args_dict.get("failure_notif_options", [])
+    failure_emails_str = default_args_dict.get("failure_emails", "")
+    failure_emails = [email.strip() for email in failure_emails_str.split(",") if email.strip()]
+    success_notif_options = default_args_dict.get("success_notif_options", [])
+    success_emails_str = default_args_dict.get("success_emails", "")
+    success_emails = [email.strip() for email in success_emails_str.split(",") if email.strip()]
 
     # Base imports always needed
     base_imports = [
@@ -59,13 +91,35 @@ def generate_dag_code(dag_name, schedule_interval, tasks, dependencies, custom_f
     # Add pendulum import if timezone is specified
     needs_pendulum = any("timezone=" in arg for arg in extra_args)
     if needs_pendulum:
-        base_imports.insert(0, "import pendulum")
+        base_imports.insert(0, "from pendulum import timezone")
 
     import_lines = base_imports + sorted(used_imports)
 
     code_lines = []
     code_lines.extend(import_lines)
     code_lines.append("")
+
+    if failure_notif_options:
+        code_lines.append(
+            "def make_failure_callback(failure_notif_options, failure_emails):\n"
+            "    def on_failure_callback(context):\n"
+            "        from utils.alert_notification_handlers import notify_failure\n"
+            "        notify_failure(context, notif_options=failure_notif_options, emails=failure_emails)\n"
+            "    return on_failure_callback\n"
+        )
+    if success_notif_options:
+        code_lines.append(
+            "def make_success_callback(success_notif_options, success_emails):\n"
+            "    def on_success_callback(context):\n"
+            "        from utils.alert_notification_handlers import notify_success\n"
+            "        notify_success(context, notif_options=success_notif_options, emails=success_emails)\n"
+            "    return on_success_callback\n"
+        )
+
+    if custom_functions:
+        custom_functions = clean_duplicate_imports(custom_functions)
+        for k in custom_functions:
+            custom_functions[k] = fix_datetime_calls(custom_functions[k])
 
     # Custom functions
     for fname, fcode in custom_functions.items():
@@ -74,8 +128,23 @@ def generate_dag_code(dag_name, schedule_interval, tasks, dependencies, custom_f
         code_lines.append("")
 
     default_args_lines = ["default_args = {"]
+    excluded_keys = {
+        "failure_notif_options",
+        "failure_emails",
+        "success_notif_options",
+        "success_emails",
+    }
     for k, v in default_args_dict.items():
+        if k in excluded_keys:
+            continue  # Skip notification configs here
         default_args_lines.append(f'    "{k}": {python_repr(v)},')
+    for extra in extra_args:
+        if extra.startswith('timezone='):
+            default_args_lines.append(f'    "timezone": timezone("Europe/London")')
+    if failure_notif_options:
+        default_args_lines.append(f'    "on_failure_callback": make_failure_callback({failure_notif_options}, {failure_emails}),')
+    if success_notif_options:
+        default_args_lines.append(f'    "on_success_callback": make_success_callback({success_notif_options}, {success_emails}),')
     default_args_lines.append("}")
     default_args_lines.append("")
 
@@ -86,11 +155,12 @@ def generate_dag_code(dag_name, schedule_interval, tasks, dependencies, custom_f
         "with DAG(",
         f"    dag_id='{dag_name}',",
         "    default_args=default_args,",
-        f"    schedule_interval='{schedule_interval}',"
+        f"    schedule_interval='{schedule_interval}',",
     ]
 
     for extra in extra_args:
-        dag_lines.append(f"    {extra},")
+        if not extra.startswith('timezone='):
+            dag_lines.append(f"    {extra},")
 
     if dag_lines[-1].endswith(","):
         dag_lines[-1] = dag_lines[-1][:-1]
@@ -102,9 +172,30 @@ def generate_dag_code(dag_name, schedule_interval, tasks, dependencies, custom_f
 
     # Indented task blocks
     for task_id, task_type, params in tasks:
+        task_args = default_args_dict.copy()
+
+        # Check if individual retry enabled; assuming you track that flag in params
+        if params.get("individual_retry_enabled", False):
+            if "retries" in params:
+                task_args["retries"] = params["retries"]
+            if "retry_delay_value" in params and "retry_delay_unit" in params:
+                # Convert to timedelta
+                retry_delay = format_timedelta_code(params["retry_delay_value"], params["retry_delay_unit"])
+                task_args["retry_delay"] = retry_delay
+            if "retry_exponential_backoff" in params:
+                task_args["retry_exponential_backoff"] = params["retry_exponential_backoff"]
+            if "max_retry_delay_value" in params and "max_retry_delay_unit" in params:
+                max_retry_delay = format_timedelta_code(params["max_retry_delay_value"], params["max_retry_delay_unit"])
+                task_args["max_retry_delay"] = max_retry_delay
+        else:
+            # Do not add retries or retry_delay keys so global defaults apply implicitly
+            # optionally explicitly delete retry keys if present
+            for key in ["retries", "retry_delay", "retry_exponential_backoff", "max_retry_delay"]:
+                task_args.pop(key, None)
+
         handler = TASK_TYPES.get(task_type)
         if handler:
-            task_code = handler.generate_code(task_id, params)
+            task_code = handler.generate_code(task_id, params, task_args)
             task_code_indented = "\n".join("    " + line if line.strip() else "" for line in task_code.splitlines())
             code_lines.append(task_code_indented)
         else:
