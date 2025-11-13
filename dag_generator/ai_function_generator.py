@@ -76,6 +76,53 @@ class AIFunctionGenerator:
                 'error': f"Function generation failed: {str(e)}"
             }
 
+    def generate_code_review(self, dag_code: str) -> dict:
+        review_prompt = (
+            "You are an expert Airflow developer. Review the following generated Airflow DAG Python code. "
+            "Provide detailed feedback on code quality, optimization, best practices, security vulnerabilities, "
+            "inefficient dependency patterns, bottlenecks, and error handling. Suggest improvements and highlight potential issues.\n\n"
+            f"### DAG Code ###\n{dag_code}\n\n### Review ###"
+        )
+        try:
+            review_text = self._call_llm(review_prompt)
+            return {
+                'success': True,
+                'review': review_text,
+                'error': None
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'review': '',
+                'error': f"Code review generation failed: {str(e)}"
+            }
+
+    def generate_unit_tests(self, dag_code: str) -> dict:
+        """
+        Generate pytest unit test scripts for the given Airflow DAG code using AI.
+
+        Args:
+            dag_code: The Python Airflow DAG code string.
+
+        Returns:
+            dict: {
+                'success': True/False,
+                'unit_tests': generated pytest code string or '',
+                'error': error message if any
+            }
+        """
+        prompt = (
+            "As a Python expert, write comprehensive pytest-based unit tests for the following Airflow DAG code. "
+            "Cover task dependencies, parameter edge cases, notification handlers, success and failure scenarios. "
+            "Use mocks for Airflow operators as needed. Provide only the Python test code without explanation.\n\n"
+            f"### DAG Code ###\n{dag_code}\n\n### Unit Tests ###"
+        )
+        try:
+            test_code = self._call_llm(prompt)
+            return {'success': True, 'unit_tests': test_code, 'error': None}
+        except Exception as e:
+            return {'success': False, 'unit_tests': '', 'error': f"Test generation failed: {str(e)}"}
+
     def _build_prompt(self, description: str, context: str) -> str:
         """Build optimized prompt for LLM based on context"""
 
@@ -270,8 +317,8 @@ Generate ONLY the Python function code. No explanations or markdown."""
             (is_valid, error_message)
         """
         # Check if code starts with 'def'
-        if not code.strip().startswith('def '):
-            return False, "Code must start with function definition"
+        if 'def' not in code.strip():
+            return False, "Code must contain a function definition"
 
         # Check syntax
         try:
