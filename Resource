@@ -1,0 +1,129 @@
+import streamlit as st
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.context import get_active_session
+import pandas as pd
+
+# Snowflake session (auto-configured in Snowflake)
+session = get_active_session()
+
+st.set_page_config(page_title="Resource Tracker", layout="wide")
+st.title("👥 Employee Resource Tracker")
+
+# Sidebar: Employee Search
+st.sidebar.header("🔍 Search Employee")
+search_term = st.sidebar.text_input("Name, ID, RACF, Email")
+
+if search_term:
+    employees_df = session.sql(f"""
+        SELECT DISTINCT 
+            employee_id, employee_racf, employee_name, 
+            employee_work_email, line_manager_id
+        FROM PRS.RESOURCE_ALLOCATIONS 
+        WHERE employee_id ILIKE '%{search_term}%' 
+           OR employee_racf ILIKE '%{search_term}%' 
+           OR employee_name ILIKE '%{search_term}%'
+           OR employee_work_email ILIKE '%{search_term}%'
+        ORDER BY employee_name
+        LIMIT 50
+    """).to_pandas()
+    
+    if not employees_df.empty:
+        selected_employee = st.sidebar.selectbox(
+            "Select Employee:",
+            employees_df['employee_id'],
+            format_func=lambda x: f"{employees_df[employees_df['employee_id']==x]['employee_name'].iloc[0]} ({x})"
+        )
+        
+        # Show selected employee details
+        emp_info = employees_df[employees_df['employee_id'] == selected_employee].iloc[0]
+        st.sidebar.markdown(f"**Manager:** {emp_info['line_manager_id']}")
+        st.sidebar.markdown(f"**Email:** {emp_info['employee_work_email']}")
+        
+        # Main page: Current allocations + Add new
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader(f"📊 Current Allocations - {selected_employee}")
+            
+            # Current allocations
+            allocs = session.sql(f"""
+                SELECT project_code, allocation_pct, allocation_start_date
+                FROM PRS.RESOURCE_ALLOCATIONS 
+                WHERE employee_id = '{selected_employee}' 
+                  AND project_code IS NOT NULL
+                ORDER BY allocation_start_date DESC
+            """).to_pandas()
+            
+            if not allocs.empty:
+                total_pct = allocs['allocation_pct'].sum()
+                st.metric("Total Allocated", f"{total_pct}%", f"{100-total_pct}% Free")
+                st.dataframe(allocs, use_container_width=True)
+            else:
+                st.info("No allocations yet. Add first project below.")
+        
+        with col2:
+            st.subheader("➕ Add/Update Allocation")
+            
+            with st.form("allocation_form", clear_on_submit=True):
+                project_code = st.text_input("Project Code", placeholder="e.g., PROJ_X")
+                allocation_pct = st.number_input("Allocation %", 0, 100, 0, step=5)
+                
+                submitted = st.form_submit_button("💾 Save", use_container_width=True)
+                
+                if submitted and project_code:
+                    # Validate total capacity
+                    current_total = allocs['allocation_pct'].sum() if not allocs.empty else 0
+                    new_total = current_total - allocs[allocs['project_code']==project_code]['allocation_pct'].sum() + allocation_pct
+                    
+                    if new_total <= 100:
+                        # MERGE - Update existing or insert new
+                        session.sql(f"""
+                            MERGE INTO PRS.RESOURCE_ALLOCATIONS AS target
+                            USING (VALUES ('{selected_employee}', '{project_code}', {allocation_pct})) AS source(emp_id, proj_code, pct)
+                            ON target.employee_id = source.emp_id AND target.project_code = source.proj_code
+                            WHEN MATCHED THEN 
+                                UPDATE SET allocation_pct = source.pct, updated_at = CURRENT_TIMESTAMP
+                            WHEN NOT MATCHED THEN 
+                                INSERT (employee_id, project_code, allocation_pct)
+                                VALUES (source.emp_id, source.proj_code, source.pct)
+                        """).collect()
+                        st.success("✅ Allocation updated!")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Exceeds 100%! Current: {current_total}%, Adding: {allocation_pct}%")
+                elif submitted:
+                    st.warning("⚠️ Enter Project Code")
+    
+    else:
+        st.warning("No employees found. Try different search term.")
+else:
+    st.info("👈 Enter search term in sidebar to get started")
+
+# Manager View Tab (Bonus)
+if st.sidebar.checkbox("👨‍💼 Manager Capacity View"):
+    st.subheader("Team Capacity Overview")
+    manager_id = st.text_input("Enter Manager Employee ID")
+    
+    if manager_id:
+        team_data = session.sql(f"""
+            SELECT 
+                employee_name,
+                COALESCE(SUM(allocation_pct), 0) as allocated_pct,
+                100 - COALESCE(SUM(allocation_pct), 0) as free_capacity_pct
+            FROM PRS.RESOURCE_ALLOCATIONS 
+            WHERE line_manager_id = '{manager_id}'
+              AND employee_id != '{manager_id}'
+            GROUP BY employee_id, employee_name
+            ORDER BY free_capacity_pct DESC
+        """).to_pandas()
+        
+        if not team_data.empty:
+            total_free = team_data['free_capacity_pct'].sum()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Team Size", len(team_data))
+            col2.metric("Total Free Capacity", f"{total_free:.0f}%")
+            col3.metric("Avg Free per Person", f"{total_free/len(team_data):.0f}%")
+            
+            st.dataframe(team_data, use_container_width=True)
+        else:
+            st.info("No direct reports found.")
